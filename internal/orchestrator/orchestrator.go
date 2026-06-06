@@ -98,10 +98,17 @@ func (o *Orchestrator) ListRecords(ctx context.Context) ([]*Endpoint, error) {
 			// Not operator-managed — the sidecar can't vouch for it.
 			continue
 		}
-		if !o.matchesZoneFilter(r.Name) {
+		// recordName reverse-maps our wildcard regexp rows ("*.…") and returns
+		// the literal name for normal rows. A regexp row that isn't one of ours
+		// resolves to "" — skip it rather than surface a nameless endpoint.
+		name := recordName(r)
+		if name == "" {
 			continue
 		}
-		k := key{normalizeName(r.Name), strings.ToUpper(r.Type)}
+		if !o.matchesZoneFilter(name) {
+			continue
+		}
+		k := key{name, strings.ToUpper(r.Type)}
 		ep, ok := bucket[k]
 		if !ok {
 			ttlSecs := 0
@@ -223,14 +230,14 @@ func (o *Orchestrator) applyCreate(ctx context.Context, e *Endpoint, byKey map[r
 		return nil
 	}
 	for _, r := range recs {
-		k := recKey{normalizeName(r.Name), r.Type}
+		k := recKey{recordName(r), r.Type}
 		// Collision: same name/type with a different non-empty comment is a
 		// row belonging to a different operator. Refuse to clobber.
 		clash := false
 		for _, ex := range byKey[k] {
 			if ex.Comment != "" && ex.Comment != owner {
 				log.Printf("orchestrator: skip create %s/%s — existing row owned by %q (request owner %q)",
-					r.Type, r.Name, ex.Comment, owner)
+					r.Type, k.name, ex.Comment, owner)
 				clash = true
 				break
 			}
@@ -242,16 +249,16 @@ func (o *Orchestrator) applyCreate(ctx context.Context, e *Endpoint, byKey map[r
 		// (RFC 1034 §3.6.2). RouterOS itself enforces this on add but
 		// we surface a clearer log line.
 		if r.Type == "CNAME" && hasOtherTypeAtName(byKey, k.name, "CNAME") {
-			log.Printf("orchestrator: skip create CNAME %s — other types already present at name", r.Name)
+			log.Printf("orchestrator: skip create CNAME %s — other types already present at name", k.name)
 			continue
 		}
 		if r.Type != "CNAME" && hasOtherTypeAtName(byKey, k.name, "") && hasTypeAtName(byKey, k.name, "CNAME") {
-			log.Printf("orchestrator: skip create %s/%s — CNAME present at name", r.Type, r.Name)
+			log.Printf("orchestrator: skip create %s/%s — CNAME present at name", r.Type, k.name)
 			continue
 		}
 		id, err := o.client.Add(ctx, r)
 		if err != nil {
-			log.Printf("orchestrator: add %s/%s failed: %v", r.Type, r.Name, err)
+			log.Printf("orchestrator: add %s/%s failed: %v", r.Type, k.name, err)
 			return err
 		}
 		// Update the local index so subsequent operations in the same
@@ -373,10 +380,25 @@ func (o *Orchestrator) applyDelete(ctx context.Context, e *Endpoint, byKey map[r
 
 type recKey struct{ name, rtype string }
 
+// recordName returns the logical DNS name used for indexing/keying a row.
+// Rows read from the router already have their wildcard regexp reverse-mapped
+// into Name by sentenceToRecord, so Name is authoritative there. Rows we
+// build for Add carry the wildcard in Regexp with an empty Name, so we derive
+// the same "*.…" name from Regexp here. This keeps the create-collision and
+// update/delete lookups symmetric between built and read records.
+func recordName(r mikrotik.Record) string {
+	if r.Name == "" && r.Regexp != "" {
+		if w, ok := mikrotik.RegexpToWildcard(r.Regexp); ok {
+			return normalizeName(w)
+		}
+	}
+	return normalizeName(r.Name)
+}
+
 func indexByNameType(rows []mikrotik.Record) map[recKey][]mikrotik.Record {
 	out := map[recKey][]mikrotik.Record{}
 	for _, r := range rows {
-		k := recKey{normalizeName(r.Name), strings.ToUpper(r.Type)}
+		k := recKey{recordName(r), strings.ToUpper(r.Type)}
 		out[k] = append(out[k], r)
 	}
 	return out
@@ -449,10 +471,21 @@ func (o *Orchestrator) endpointToRecords(e *Endpoint, owner string) ([]mikrotik.
 		ttl = mikrotik.SecondsToDuration(ttlSecs)
 	}
 	name := normalizeName(e.DNSName)
+	// Wildcard names ("*.dev.example.com") cannot be stored as a literal
+	// =name= (RouterOS would treat the asterisk as a dead literal). Translate
+	// to the RouterOS =regexp= form instead, leaving Name empty. Exactly one
+	// RouterOS row per endpoint either way — no match-subdomain on a literal
+	// name, which would conflate the apex and break the 1:1 ownership mapping.
+	regexp := ""
+	if rx, ok := mikrotik.WildcardToRegexp(name); ok {
+		regexp = rx
+		name = ""
+	}
 	out := make([]mikrotik.Record, 0, len(e.Targets))
 	for _, t := range e.Targets {
 		r := mikrotik.Record{
 			Name:    name,
+			Regexp:  regexp,
 			Type:    rtype,
 			TTL:     ttl,
 			Comment: owner,

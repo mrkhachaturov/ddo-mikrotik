@@ -28,8 +28,19 @@ type Record struct {
 	// for /set and /remove; opaque to the orchestrator.
 	ID string
 
-	// Name is the FQDN (no trailing dot) as RouterOS stores it.
+	// Name is the FQDN (no trailing dot) as RouterOS stores it. Empty for a
+	// wildcard row, which is keyed by Regexp instead (RouterOS treats a
+	// literal asterisk in `name` as a dead non-matching character). Exactly
+	// one of Name / Regexp is set on any row this sidecar writes.
 	Name string
+
+	// Regexp is the RouterOS `regexp` field, set only for DNS wildcard rows
+	// ("*.dev.example.com"). It holds the one fixed, reversible shape this
+	// sidecar writes — see wildcard.go (WildcardToRegexp / RegexpToWildcard).
+	// On read, only rows whose regexp matches that shape AND carry our
+	// ownership Comment are surfaced; arbitrary user-authored regexp rows are
+	// skipped. When Regexp is set, Name is empty (and vice versa).
+	Regexp string
 
 	// Type is one of "A", "AAAA", "CNAME", "MX", "NS". RouterOS defaults
 	// the field to "A" on add-without-type, so we always send an explicit
@@ -240,12 +251,21 @@ func (c *APIClient) Ping(ctx context.Context) error {
 // --- decode helpers -------------------------------------------------------
 
 // sentenceToRecord pulls a Record out of the proto.Sentence.Map RouterOS
-// gives us. Returns (_, false) for rows the sidecar doesn't recognise
-// (e.g. FWD/Regexp/None types) so the caller can skip them safely.
+// gives us. Returns (_, false) for rows the sidecar doesn't recognise so the
+// caller can skip them safely. This includes:
+//   - FWD/None and other unsupported rdata types;
+//   - arbitrary user-authored `regexp` rows that don't match the fixed shape
+//     this sidecar writes, OR that lack our ownership `comment`.
+//
+// For our own wildcard rows (regexp matches WildcardToRegexp's shape AND the
+// row carries an ownership comment) the regexp is reverse-mapped back to the
+// "*.…" wildcard FQDN and stored in Record.Name, so ListRecords surfaces the
+// record and the operator does not see it as missing every tick.
 func sentenceToRecord(m map[string]string) (Record, bool) {
 	r := Record{
 		ID:      m[".id"],
 		Name:    m["name"],
+		Regexp:  m["regexp"],
 		Type:    strings.ToUpper(m["type"]),
 		TTL:     m["ttl"],
 		Comment: m["comment"],
@@ -253,6 +273,16 @@ func sentenceToRecord(m map[string]string) (Record, bool) {
 		CNAME:   m["cname"],
 		NS:      m["ns"],
 		MXHost:  m["mx-exchange"],
+	}
+	if r.Name == "" && r.Regexp != "" {
+		// Wildcard candidate. Only ours: must match our regexp shape AND be
+		// owned (non-empty comment). Anything else is a user-authored row we
+		// must never claim, modify, or surface.
+		wildcard, ok := RegexpToWildcard(r.Regexp)
+		if !ok || r.Comment == "" {
+			return Record{}, false
+		}
+		r.Name = wildcard
 	}
 	if r.Type == "" {
 		// RouterOS omits =type= on plain A rows in some builds. Mirror that
@@ -288,15 +318,20 @@ func sentenceToRecord(m map[string]string) (Record, bool) {
 }
 
 // recordToAddArgs builds the RouterOS sentence for /ip/dns/static/add.
+// A wildcard row is keyed by =regexp= (RouterOS' subdomain-matching field);
+// every other row is keyed by =name= exactly as before. Exactly one of the
+// two must be set.
 func recordToAddArgs(r Record) ([]string, error) {
-	if r.Name == "" {
-		return nil, errors.New("Record.Name is required")
+	if r.Name == "" && r.Regexp == "" {
+		return nil, errors.New("Record.Name or Record.Regexp is required")
 	}
-	args := []string{
-		"/ip/dns/static/add",
-		"=name=" + r.Name,
-		"=type=" + r.Type,
+	args := []string{"/ip/dns/static/add"}
+	if r.Regexp != "" {
+		args = append(args, "=regexp="+r.Regexp)
+	} else {
+		args = append(args, "=name="+r.Name)
 	}
+	args = append(args, "=type="+r.Type)
 	if r.TTL != "" {
 		args = append(args, "=ttl="+r.TTL)
 	}

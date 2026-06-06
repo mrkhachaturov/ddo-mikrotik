@@ -322,6 +322,132 @@ func TestApplyChanges_CreateMxParsesPriority(t *testing.T) {
 	}
 }
 
+// -- Wildcard support ------------------------------------------------------
+
+// A wildcard endpoint *.dev.example.com must produce exactly ONE row that
+// uses the RouterOS regexp field (not a literal =name= with an asterisk,
+// which RouterOS treats as a dead literal hostname).
+func TestApplyChanges_CreateWildcardUsesRegexp(t *testing.T) {
+	fc := newFakeClient()
+	o := New(Options{Zones: nil, DefaultTTL: 3600}, fc)
+	err := o.ApplyChanges(context.Background(), Changes{
+		Create: []*Endpoint{{
+			DNSName:    "*.dev.example.com",
+			RecordType: "A",
+			RecordTTL:  3600,
+			Targets:    []string{"10.0.0.1"},
+			Labels:     map[string]string{"owner": "docker-dns-operator:alpha"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.addCalls) != 1 {
+		t.Fatalf("expected exactly one Add for a wildcard endpoint, got %d", len(fc.addCalls))
+	}
+	added := fc.addCalls[0]
+	if added.Name != "" {
+		t.Fatalf("wildcard row must leave Name empty, got %q", added.Name)
+	}
+	if added.Regexp != `^.*\.dev\.example\.com$` {
+		t.Fatalf("wildcard regexp wrong: %q", added.Regexp)
+	}
+	if added.Comment != "docker-dns-operator:alpha" {
+		t.Fatalf("ownership comment must be on the regexp row, got %q", added.Comment)
+	}
+	if added.Address != "10.0.0.1" || added.Type != "A" {
+		t.Fatalf("rdata wrong: %+v", added)
+	}
+}
+
+// On read, our regexp row reverse-maps to the wildcard DNSName so the
+// operator sees the record (no infinite create/diff churn).
+func TestListRecords_WildcardRegexpReversesToDNSName(t *testing.T) {
+	fc := newFakeClient(mikrotik.Record{
+		Regexp: `^.*\.dev\.example\.com$`, Type: "A", Address: "10.0.0.1",
+		TTL: "1h", Comment: "docker-dns-operator:alpha",
+	})
+	o := New(Options{Zones: nil, DefaultTTL: 3600}, fc)
+	got, err := o.ListRecords(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one wildcard endpoint, got %d", len(got))
+	}
+	if got[0].DNSName != "*.dev.example.com" {
+		t.Fatalf("regexp not reversed to wildcard DNSName: %q", got[0].DNSName)
+	}
+	if got[0].Labels["owner"] != "docker-dns-operator:alpha" {
+		t.Fatalf("owner not round-tripped: %+v", got[0])
+	}
+	if got[0].RecordType != "A" || len(got[0].Targets) != 1 || got[0].Targets[0] != "10.0.0.1" {
+		t.Fatalf("rdata wrong: %+v", got[0])
+	}
+}
+
+// Full Apply -> List round-trip for a wildcard A record. The record must
+// be surfaced (not seen as missing), which is what prevents churn.
+func TestWildcard_ApplyThenListRoundTrip(t *testing.T) {
+	fc := newFakeClient()
+	o := New(Options{Zones: nil, DefaultTTL: 3600}, fc)
+	if err := o.ApplyChanges(context.Background(), Changes{
+		Create: []*Endpoint{{
+			DNSName: "*.dev.example.com", RecordType: "A", RecordTTL: 3600,
+			Targets: []string{"10.0.0.1"},
+			Labels:  map[string]string{"owner": "docker-dns-operator:alpha"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := o.ListRecords(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].DNSName != "*.dev.example.com" {
+		t.Fatalf("wildcard did not round-trip Apply->List: %+v", got)
+	}
+	if got[0].Labels["owner"] != "docker-dns-operator:alpha" {
+		t.Fatalf("owner lost on round-trip: %+v", got[0])
+	}
+}
+
+// A user-authored regexp row WITHOUT our ownership comment must be skipped
+// on read (never surfaced as a managed endpoint).
+func TestListRecords_UserRegexpRowSkipped(t *testing.T) {
+	fc := newFakeClient(mikrotik.Record{
+		Regexp: `\.example\.com`, Type: "A", Address: "10.0.0.1", Comment: "",
+	})
+	o := New(Options{Zones: nil, DefaultTTL: 3600}, fc)
+	got, err := o.ListRecords(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("user-authored regexp row must not surface: %+v", got)
+	}
+}
+
+// Non-wildcard records are unchanged: still use =name=, never regexp.
+func TestApplyChanges_NonWildcardUnchanged(t *testing.T) {
+	fc := newFakeClient()
+	o := New(defaultOpts(), fc)
+	if err := o.ApplyChanges(context.Background(), Changes{
+		Create: []*Endpoint{{
+			DNSName: "app.home.lan", RecordType: "A", Targets: []string{"10.0.0.1"},
+			Labels: map[string]string{"owner": "x"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(fc.addCalls) != 1 {
+		t.Fatalf("expected one Add, got %d", len(fc.addCalls))
+	}
+	if fc.addCalls[0].Name != "app.home.lan" || fc.addCalls[0].Regexp != "" {
+		t.Fatalf("non-wildcard record must use Name and no Regexp: %+v", fc.addCalls[0])
+	}
+}
+
 // -- ApplyChanges update ---------------------------------------------------
 
 func TestApplyChanges_UpdateSetsExistingRowSameOwner(t *testing.T) {

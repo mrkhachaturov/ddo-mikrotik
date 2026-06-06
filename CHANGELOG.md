@@ -6,7 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ddo-mikrotik is a webhook sidecar for [docker-dns-operator](https://github.com/mrkhachaturov/docker-dns-operator), implementing the [external-dns webhook provider v1 contract](https://kubernetes-sigs.github.io/external-dns/latest/docs/tutorials/webhook-provider/) against the native RouterOS binary API. The same sidecar works with the upstream kubernetes-sigs/external-dns controller.
 
-## [Unreleased]
+## [0.2.0] — 2026-06-07
+
+### Added
+- Wildcard DNS support (A/AAAA/CNAME and other supported types). An endpoint with a `*.`-prefixed `DNSName` (e.g. `*.dev.example.com`) is now written as a single RouterOS `/ip/dns/static` row using the `regexp` field instead of a literal `name`. RouterOS treats a literal asterisk in `name` as a dead, non-matching hostname; the `regexp` form (`^.*\.dev\.example\.com$`) correctly matches subdomain queries (`foo.dev.example.com` and deeper). The ownership `comment` is stamped on the regexp row exactly as on literal rows.
+
+### Fixed
+- Wildcard records no longer churn (infinite create/diff every reconcile tick). `ListRecords` now reverse-maps our own regexp rows back to the `*.…` wildcard `DNSName`, so the operator sees the record as present. Only regexp rows that match the exact shape this sidecar writes **and** carry our ownership `comment` are surfaced; arbitrary user-authored regexp rows are still skipped on read and never modified.
+- `GET /` now emits the domain filter as `include` (per external-dns `endpoint.DomainFilter`) instead of the legacy `filters` key, which upstream parses as an unset filter — previously every record was routed through the sidecar regardless of zone.
 
 ## [0.1.1] — 2026-05-25
 
@@ -31,6 +38,7 @@ First tagged release.
 - Distroless image, pure Go, CGO disabled.
 - Requires a dedicated RouterOS user with `read+write+api` policies (console/SSH/Winbox/REST should be denied). See [README.md](README.md) for the step-by-step user setup.
 
-[Unreleased]: https://github.com/mrkhachaturov/ddo-mikrotik/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/mrkhachaturov/ddo-mikrotik/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mrkhachaturov/ddo-mikrotik/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/mrkhachaturov/ddo-mikrotik/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mrkhachaturov/ddo-mikrotik/releases/tag/v0.1.0
