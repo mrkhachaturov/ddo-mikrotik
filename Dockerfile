@@ -2,7 +2,7 @@
 #
 # Pure-Go build — no system Kerberos / OpenSSL dependencies. CGO is left
 # disabled so the resulting binary runs on distroless without any glibc.
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
